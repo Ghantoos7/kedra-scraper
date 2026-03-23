@@ -1,0 +1,134 @@
+# =============================================================================
+# Kedra WRC Scraper - Docker Compose
+# Services: MongoDB (metadata), MinIO (document storage), Dagster (orchestration)
+# =============================================================================
+
+version: "3.8"
+
+services:
+  # ---------------------------------------------------------------------------
+  # MongoDB - NoSQL database for metadata storage
+  # Landing Zone: landing_metadata collection
+  # Transformed Zone: transformed_metadata collection
+  # ---------------------------------------------------------------------------
+  mongodb:
+    image: mongo:7.0.14
+    container_name: kedra-mongodb
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    environment:
+      # No auth for local dev — in production you'd add MONGO_INITDB_ROOT_USERNAME/PASSWORD
+      MONGO_INITDB_DATABASE: ${MONGO_DB:-kedra_wrc}
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # MinIO - S3-compatible object storage for documents
+  # Landing Zone: landing-docs bucket
+  # Transformed Zone: transformed-docs bucket
+  # ---------------------------------------------------------------------------
+  minio:
+    image: minio/minio:RELEASE.2024-06-13T22-53-53Z
+    container_name: kedra-minio
+    ports:
+      - "9000:9000"   # API endpoint
+      - "9001:9001"   # Web console (usefull for debugging because you can see the UI like scrolling throug s3)
+    volumes:
+      - minio_data:/data
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-kedra_admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-kedra_secret_key_2024}
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # MinIO bucket initialization
+  # Creates the landing-docs and transformed-docs buckets on startup
+  # ---------------------------------------------------------------------------
+  minio-init:
+    image: minio/mc:RELEASE.2024-06-12T14-34-03Z
+    container_name: kedra-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set kedra http://minio:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD};
+      mc mb kedra/${MINIO_LANDING_BUCKET:-landing-docs} --ignore-existing;
+      mc mb kedra/${MINIO_TRANSFORMED_BUCKET:-transformed-docs} --ignore-existing;
+      echo 'Buckets created successfully';
+      exit 0;
+      "
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-kedra_admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-kedra_secret_key_2024}
+
+  # ---------------------------------------------------------------------------
+  # Dagster - Pipeline orchestration
+  # Webserver provides UI for monitoring runs at http://localhost:3000
+  # ---------------------------------------------------------------------------
+  dagster-webserver:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kedra-dagster-webserver
+    ports:
+      - "3000:3000"
+    volumes:
+      - .:/app
+      - dagster_home:/opt/dagster/dagster_home
+    env_file:
+      - .env
+    environment:
+      # Override hosts to use Docker service names instead of localhost
+      MONGO_HOST: mongodb
+      MINIO_ENDPOINT: minio:9000
+      DAGSTER_HOME: /opt/dagster/dagster_home
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    command: dagster-webserver -h 0.0.0.0 -p 3000 -w /app/orchestration/workspace.yaml
+    restart: unless-stopped
+
+  dagster-daemon:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kedra-dagster-daemon
+    volumes:
+      - .:/app
+      - dagster_home:/opt/dagster/dagster_home
+    env_file:
+      - .env
+    environment:
+      MONGO_HOST: mongodb
+      MINIO_ENDPOINT: minio:9000
+      DAGSTER_HOME: /opt/dagster/dagster_home
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    command: dagster-daemon run
+    restart: unless-stopped
+
+volumes:
+  mongo_data:
+    driver: local
+  minio_data:
+    driver: local
+  dagster_home:
+    driver: local
