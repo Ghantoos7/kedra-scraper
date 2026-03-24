@@ -45,3 +45,7 @@ class WrcDecisionItem(scrapy.Item):
 
     # Metadata
     scraped_at = scrapy.Field()
+
+    # Internal/temporary (used by pipelines, not stored in MongoDB)
+    _file_content = scrapy.Field()
+    _needs_download = scrapy.Field()

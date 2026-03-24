@@ -59,10 +59,14 @@ DEFAULT_REQUEST_HEADERS = {
     "Accept-Encoding": "gzip, deflate",
 }
 
-# --- Pipelines (will be enabled in Phase 3) ---
+# --- Pipelines ---
+# Execution order: lower number = runs first
+# Spider handles document downloading and hash calculation.
+# 1. MinioPipeline (200): Uploads file to object storage
+# 2. MongoPipeline (300): Stores metadata in MongoDB with idempotency
 ITEM_PIPELINES = {
-    # "scraper.pipelines.MongoPipeline": 300,
-    # "scraper.pipelines.MinioPipeline": 400,
+    "scraper.pipelines.MinioPipeline": 200,
+    "scraper.pipelines.MongoPipeline": 300,
 }
 
 # --- Logging ---

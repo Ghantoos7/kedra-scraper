@@ -20,6 +20,7 @@ HTML structure (from inspecting the live site):
 """
 
 import scrapy
+import hashlib
 import logging
 from datetime import date, datetime
 from urllib.parse import urlencode
@@ -173,7 +174,20 @@ class WrcDecisionsSpider(scrapy.Spider):
                 decision = self._extract_item(item_sel, meta)
                 if decision:
                     self.stats_per_partition[partition_key]["records_scraped"] += 1
-                    yield decision
+                    # Follow the document URL to download the actual content
+                    doc_url = decision.get("doc_url", "")
+                    if doc_url:
+                        yield scrapy.Request(
+                            url=doc_url,
+                            callback=self.parse_document,
+                            meta={
+                                **meta,
+                                "item": decision,
+                            },
+                            errback=self.handle_doc_error,
+                        )
+                    else:
+                        yield decision
             except Exception as e:
                 self.stats_per_partition[partition_key]["records_failed"] += 1
                 failed_url = item_sel.css("h2.title a::attr(href)").get("unknown")
@@ -260,6 +274,100 @@ class WrcDecisionsSpider(scrapy.Spider):
         except (ValueError, IndexError):
             pass
         return None
+
+    def parse_document(self, response):
+        """
+        Process a downloaded document page.
+
+        Determines file type from the response headers:
+        - PDF/DOC → store raw bytes as-is, hash the raw bytes
+        - HTML → store the full page as .html, but hash ONLY the main
+          content (excluding navbars, footers, cookies, session tokens)
+          to produce a stable hash that doesn't change between requests
+
+        Calculates SHA-256 hash and attaches everything to the item
+        for the pipelines to store.
+        """
+        item = response.meta["item"]
+        content_type = response.headers.get("Content-Type", b"").decode("utf-8", errors="ignore").lower()
+        body_bytes = response.body
+
+        # Determine file type from Content-Type header
+        if "pdf" in content_type:
+            file_type = "pdf"
+        elif "msword" in content_type or "officedocument" in content_type:
+            file_type = "doc"
+        else:
+            # Default to HTML (most WRC decisions are HTML pages)
+            file_type = "html"
+
+        # Calculate SHA-256 hash
+        # For HTML: hash only the main content text to avoid dynamic elements
+        # (cookie banners, session tokens, timestamps) that change every request.
+        # For PDF/DOC: hash the raw bytes since they don't have dynamic content.
+        if file_type == "html":
+            # Extract text from the main content area only
+            # This excludes navigation, footers, cookie banners, scripts
+            main_content = response.css("#main ::text").getall()
+            if not main_content:
+                # Fallback: try the content area or body text
+                main_content = response.css(".content-module-padding ::text, .decisions-body ::text, article ::text").getall()
+            if not main_content:
+                # Last fallback: all body text
+                main_content = response.css("body ::text").getall()
+            
+            # Join, strip whitespace, encode — this produces a stable hash
+            content_text = " ".join(t.strip() for t in main_content if t.strip())
+            file_hash = hashlib.sha256(content_text.encode("utf-8")).hexdigest()
+        else:
+            file_hash = hashlib.sha256(body_bytes).hexdigest()
+
+        # Build the storage path: body/partition/identifier.ext
+        body_name = item.get("body", "unknown").replace(" ", "_")
+        partition = item.get("partition_date", "unknown")
+        identifier = item.get("identifier", "unknown").replace("/", "-")
+        object_name = f"{body_name}/{partition}/{identifier}.{file_type}"
+
+        # Attach download info to the item
+        item["file_type"] = file_type
+        item["file_hash"] = file_hash
+        item["file_path"] = object_name
+        # Temporary field — used by MinioPipeline, not stored in MongoDB
+        item["_file_content"] = body_bytes
+
+
+
+        yield item
+
+    def handle_doc_error(self, failure):
+        """
+        Handle document download failures.
+        Still yields the item so metadata is saved, but without file info.
+        """
+        request = failure.request
+        meta = request.meta
+        item = meta.get("item")
+        partition_key = meta.get("partition_key", "unknown")
+
+        logger.error(
+            "Document download failed: identifier=%s, url=%s, error=%s",
+            item.get("identifier", "unknown") if item else "unknown",
+            request.url,
+            str(failure.value),
+        )
+
+        if partition_key in self.stats_per_partition:
+            self.stats_per_partition[partition_key]["failed_urls"].append({
+                "url": request.url,
+                "error": f"Document download failed: {str(failure.value)}",
+            })
+
+        # Still yield the item with metadata, just without file info
+        if item:
+            item["file_type"] = "unknown"
+            item["file_hash"] = None
+            item["file_path"] = None
+            yield item
 
     def handle_error(self, failure):
         """
