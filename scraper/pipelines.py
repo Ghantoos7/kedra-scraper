@@ -5,25 +5,28 @@ Pipeline execution order (lower number = runs first):
   1. MinioPipeline (200) — Uploads downloaded file to object storage
   2. MongoPipeline (300) — Stores metadata in MongoDB with idempotency
 
-The spider handles document downloading and hash calculation before
-items reach these pipelines. Each item arrives with:
-  - _file_content: raw bytes of the document
-  - file_hash: SHA-256 hash
-  - file_path: target path in MinIO
-  - file_type: html, pdf, or doc
+Optimizations for scale (designed for 1M+ records):
+  - MongoPipeline preloads existing hashes into memory at startup
+    for O(1) idempotency lookups (no per-item find_one queries)
+  - Bulk write operations flush every BATCH_SIZE items instead of
+    individual insert/update per item
+  - MinIO uploads are per-item (can't be batched due to binary data)
 """
 
 import logging
 from datetime import datetime
 
 from scrapy.exceptions import DropItem
-from pymongo import MongoClient
-from pymongo.errors import PyMongoError
+from pymongo import MongoClient, UpdateOne, InsertOne
+from pymongo.errors import PyMongoError, BulkWriteError
 
 from config import MongoConfig, MinioConfig
 from utils.storage import upload_bytes, ensure_bucket
 
 logger = logging.getLogger(__name__)
+
+# Batch size for bulk MongoDB writes
+MONGO_BATCH_SIZE = 100
 
 
 class MinioPipeline:
@@ -33,17 +36,11 @@ class MinioPipeline:
     File organization in the bucket:
         landing-docs/
         ├── Labour_Court/
-        │   ├── 2024-01-01/
-        │   │   ├── LCR22912.html
-        │   │   └── PWD246.html
-        │   └── 2024-02-01/
-        │       └── ...
-        ├── Workplace_Relations_Commission/
-        │   └── ...
-        └── ...
-
-    Idempotency: If a file with the same path already exists and the
-    hash hasn't changed, the upload is skipped.
+        │   └── 2024-01-01/
+        │       ├── LCR22912.html
+        │       └── PWD246.html
+        └── Workplace_Relations_Commission/
+            └── ...
     """
 
     def open_spider(self, spider):
@@ -54,25 +51,16 @@ class MinioPipeline:
     def process_item(self, item, spider):
         """
         Upload the document file to MinIO.
-
-        Reads _file_content from the item (set by spider's parse_document),
-        uploads to MinIO, then removes _file_content from the item so it
-        doesn't get stored in MongoDB.
+        Skips upload if no file content is attached.
         """
         file_content = item.get("_file_content")
         file_path = item.get("file_path")
         file_type = item.get("file_type", "html")
 
         if not file_content or not file_path:
-            logger.debug(
-                "No file content for %s, skipping upload",
-                item.get("identifier", "unknown"),
-            )
-            # Remove temporary field before passing to MongoDB pipeline
             item.pop("_file_content", None)
             return item
 
-        # Determine content type for proper storage
         content_type_map = {
             "html": "text/html",
             "pdf": "application/pdf",
@@ -81,13 +69,12 @@ class MinioPipeline:
         content_type = content_type_map.get(file_type, "application/octet-stream")
 
         try:
-            full_path = upload_bytes(
+            upload_bytes(
                 bucket=MinioConfig.LANDING_BUCKET,
                 object_name=file_path,
                 data=file_content,
                 content_type=content_type,
             )
-            logger.debug("Uploaded: %s (%d bytes)", full_path, len(file_content))
         except Exception as e:
             logger.error(
                 "MinIO upload failed for %s: %s",
@@ -95,7 +82,7 @@ class MinioPipeline:
                 str(e),
             )
 
-        # Remove temporary field — raw bytes should NOT go to MongoDB
+        # Remove raw bytes before passing to MongoDB pipeline
         item.pop("_file_content", None)
         return item
 
@@ -104,47 +91,64 @@ class MongoPipeline:
     """
     Stores item metadata in MongoDB with idempotency.
 
-    Idempotency logic (requirement #9):
-    - Uses 'identifier' as the unique key for each record
-    - On first scrape: inserts the record
-    - On re-scrape with same file_hash: skips (no update needed)
-    - On re-scrape with different file_hash: updates the record
+    Scalability optimizations:
+    1. On spider open: preloads ALL existing {identifier: file_hash} pairs
+       into an in-memory dict. This avoids per-item find_one queries.
+       For 1M records, this dict uses ~100MB of RAM (acceptable).
 
-    This ensures running the pipeline twice on the same date range
-    does NOT create duplicate records or re-download unchanged files.
+    2. Items are collected into a batch buffer. Every BATCH_SIZE items,
+       the buffer is flushed to MongoDB using bulk_write (single round-trip
+       for N operations instead of N round-trips).
+
+    3. Remaining items are flushed on spider close.
+
+    Idempotency flow (per item, in memory):
+      - identifier not in cache → queue InsertOne
+      - identifier in cache, hash differs → queue UpdateOne
+      - identifier in cache, hash matches → skip (no DB call)
     """
 
     def __init__(self):
         self.client = None
         self.db = None
         self.collection = None
-        # Counters for summary logging
+        # In-memory cache: {identifier: file_hash}
+        self.hash_cache = {}
+        # Batch buffer for bulk writes
+        self.batch_buffer = []
+        # Counters
         self.inserted = 0
         self.updated = 0
         self.skipped = 0
 
     def open_spider(self, spider):
         """
-        Connect to MongoDB when the spider starts.
-        Creates indexes for fast lookups and uniqueness.
+        Connect to MongoDB, create indexes, and preload existing hashes.
         """
         try:
             self.client = MongoClient(MongoConfig.connection_uri())
             self.db = self.client[MongoConfig.DB]
             self.collection = self.db[MongoConfig.LANDING_COLLECTION]
 
-            # Unique index on identifier — enforces no duplicate records
+            # Create indexes
             self.collection.create_index("identifier", unique=True)
+            self.collection.create_index([("body", 1), ("partition_date", 1)])
 
-            # Compound index for efficient date-range + body queries
-            # (used by the transformation script in Phase 4)
-            self.collection.create_index([
-                ("body", 1),
-                ("partition_date", 1),
-            ])
+            # Index for transformation queries by published date
+            self.collection.create_index("published_date_iso")
+
+            # Preload existing hashes for O(1) idempotency checks.
+            # Only loads identifier and file_hash — not full documents.
+            cursor = self.collection.find(
+                {},
+                {"identifier": 1, "file_hash": 1, "_id": 0},
+            )
+            for doc in cursor:
+                self.hash_cache[doc["identifier"]] = doc.get("file_hash")
 
             logger.info(
-                "MongoDB pipeline ready. DB: %s, Collection: %s",
+                "MongoDB pipeline ready. Preloaded %d existing hashes. DB: %s, Collection: %s",
+                len(self.hash_cache),
                 MongoConfig.DB,
                 MongoConfig.LANDING_COLLECTION,
             )
@@ -153,9 +157,14 @@ class MongoPipeline:
             raise
 
     def close_spider(self, spider):
-        """Close MongoDB connection and log summary when spider finishes."""
+        """Flush remaining batch and close connection."""
+        # Flush any remaining items in the buffer
+        if self.batch_buffer:
+            self._flush_batch()
+
         if self.client:
             self.client.close()
+
         logger.info(
             "MongoDB summary: inserted=%d, updated=%d, skipped=%d",
             self.inserted, self.updated, self.skipped,
@@ -163,13 +172,7 @@ class MongoPipeline:
 
     def process_item(self, item, spider):
         """
-        Store or update the item in MongoDB.
-
-        Idempotency flow:
-        1. Look up existing record by identifier
-        2. If not found → insert new record
-        3. If found and hash matches → skip (unchanged)
-        4. If found and hash differs → update (document changed)
+        Check idempotency in memory, queue write operation, flush when batch is full.
         """
         try:
             record = self._item_to_dict(item)
@@ -178,34 +181,33 @@ class MongoPipeline:
             if not identifier:
                 raise DropItem("Item has no identifier, dropping")
 
-            # Check if record already exists
-            existing = self.collection.find_one({"identifier": identifier})
+            existing_hash = self.hash_cache.get(identifier)
 
-            if existing is None:
-                # New record — insert
-                self.collection.insert_one(record)
+            if existing_hash is None:
+                # New record → queue insert
+                self.batch_buffer.append(("insert", record))
+                self.hash_cache[identifier] = record.get("file_hash")
                 self.inserted += 1
-                logger.debug("Inserted: %s", identifier)
 
-            elif existing.get("file_hash") != record.get("file_hash"):
-                # Hash changed — document was updated on the source site
-                self.collection.update_one(
-                    {"identifier": identifier},
-                    {"$set": record},
-                )
+            elif existing_hash != record.get("file_hash"):
+                # Hash changed → queue update
+                self.batch_buffer.append(("update", record))
+                self.hash_cache[identifier] = record.get("file_hash")
                 self.updated += 1
-                logger.info("Updated (hash changed): %s", identifier)
 
             else:
-                # Same hash — no changes, skip
+                # Same hash → skip entirely (no DB call)
                 self.skipped += 1
-                logger.debug("Skipped (unchanged): %s", identifier)
+
+            # Flush batch when it reaches the threshold
+            if len(self.batch_buffer) >= MONGO_BATCH_SIZE:
+                self._flush_batch()
 
             return item
 
         except DropItem:
             raise
-        except PyMongoError as e:
+        except Exception as e:
             logger.error(
                 "MongoDB error for %s: %s",
                 item.get("identifier", "unknown"),
@@ -213,17 +215,57 @@ class MongoPipeline:
             )
             return item
 
+    def _flush_batch(self):
+        """
+        Execute all queued operations in a single bulk_write call.
+        One network round-trip for up to BATCH_SIZE operations.
+        """
+        if not self.batch_buffer:
+            return
+
+        operations = []
+        for op_type, record in self.batch_buffer:
+            identifier = record["identifier"]
+            if op_type == "insert":
+                operations.append(
+                    UpdateOne(
+                        {"identifier": identifier},
+                        {"$setOnInsert": record},
+                        upsert=True,
+                    )
+                )
+            elif op_type == "update":
+                operations.append(
+                    UpdateOne(
+                        {"identifier": identifier},
+                        {"$set": record},
+                    )
+                )
+
+        try:
+            if operations:
+                result = self.collection.bulk_write(operations, ordered=False)
+                logger.debug(
+                    "Bulk write: %d ops (upserted=%d, modified=%d)",
+                    len(operations),
+                    result.upserted_count,
+                    result.modified_count,
+                )
+        except BulkWriteError as e:
+            logger.error("Bulk write error: %s", str(e.details))
+        except PyMongoError as e:
+            logger.error("MongoDB bulk write failed: %s", str(e))
+
+        self.batch_buffer.clear()
+
     def _item_to_dict(self, item) -> dict:
         """
         Convert a Scrapy Item to a plain dictionary for MongoDB.
-        Excludes internal fields (prefixed with '_') and adds
-        an updated_at timestamp.
+        Excludes internal fields (prefixed with '_').
         """
         record = {}
         for key, value in item.items():
-            # Skip internal/temporary fields like _file_content
             if not key.startswith("_"):
                 record[key] = value
-
         record["updated_at"] = datetime.utcnow().isoformat()
         return record

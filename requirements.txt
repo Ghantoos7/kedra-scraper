@@ -16,3 +16,7 @@ pymongo>=4.6,<5.0
 
 # MinIO client (document/object storage)
 minio>=7.2,<8.0
+
+# HTML parsing (transformation step)
+beautifulsoup4>=4.12,<5.0
+lxml>=5.1,<6.0

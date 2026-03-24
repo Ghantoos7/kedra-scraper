@@ -4,8 +4,8 @@ Scrapy Item definitions for WRC decisions.
 Each Item represents one decision/determination record from the
 Workplace Relations website. Fields map directly to the metadata
 requirements specified in the project brief 
-(data model).
-"""
+(data model)."""
+
 
 import scrapy
 
@@ -31,6 +31,7 @@ class WrcDecisionItem(scrapy.Item):
     identifier = scrapy.Field()
     description = scrapy.Field()
     published_date = scrapy.Field()
+    published_date_iso = scrapy.Field()  # YYYY-MM-DD format for sortable queries
     ref_no = scrapy.Field()
     doc_url = scrapy.Field()
 
@@ -48,4 +49,3 @@ class WrcDecisionItem(scrapy.Item):
 
     # Internal/temporary (used by pipelines, not stored in MongoDB)
     _file_content = scrapy.Field()
-    _needs_download = scrapy.Field()

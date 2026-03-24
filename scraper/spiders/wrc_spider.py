@@ -20,14 +20,16 @@ HTML structure (from inspecting the live site):
 """
 
 import scrapy
-import hashlib
 import logging
 from datetime import date, datetime
 from urllib.parse import urlencode
 
+from pymongo import MongoClient
+
 from scraper.items import WrcDecisionItem
-from config import ScrapingConfig, BodyConfig
+from config import ScrapingConfig, BodyConfig, MongoConfig
 from utils.date_utils import generate_partitions, format_date_for_wrc
+from utils.hashing import compute_content_hash
 
 logger = logging.getLogger(__name__)
 
@@ -36,25 +38,19 @@ class WrcDecisionsSpider(scrapy.Spider):
     """
     Spider that scrapes WRC decisions across all bodies and date partitions.
 
+    Idempotency: Landing zone is write-once (append-only). On startup,
+    the spider loads all existing identifiers from MongoDB. If an identifier
+    already exists, the document is skipped entirely — no download, no storage.
+    This ensures re-running on the same date range is fast and safe.
+
     Usage:
         scrapy crawl wrc_decisions -a start_date=2024-01-01 -a end_date=2024-12-31
-
-    Arguments:
-        start_date: Start of date range (YYYY-MM-DD format)
-        end_date: End of date range (YYYY-MM-DD format)
     """
 
     name = "wrc_decisions"
     allowed_domains = ["www.workplacerelations.ie", "workplacerelations.ie"]
 
     def __init__(self, start_date: str = None, end_date: str = None, *args, **kwargs):
-        """
-        Initialize spider with date range arguments.
-
-        Args:
-            start_date: Required. Format: YYYY-MM-DD
-            end_date: Required. Format: YYYY-MM-DD
-        """
         super().__init__(*args, **kwargs)
 
         if not start_date or not end_date:
@@ -65,6 +61,16 @@ class WrcDecisionsSpider(scrapy.Spider):
         self.end_dt = date.fromisoformat(end_date)
         self.base_url = ScrapingConfig.search_url()
         self.bodies = BodyConfig.get_all()
+
+        # Preload existing identifiers for write-once idempotency.
+        # Landing zone is append-only: never update, never delete.
+        # If identifier exists → skip entirely (no download, no store).
+        mongo_client = MongoClient(MongoConfig.connection_uri())
+        collection = mongo_client[MongoConfig.DB][MongoConfig.LANDING_COLLECTION]
+        cursor = collection.find({}, {"identifier": 1, "_id": 0})
+        self.existing_identifiers = {doc["identifier"] for doc in cursor}
+        mongo_client.close()
+        logger.info("Loaded %d existing identifiers for idempotency", len(self.existing_identifiers))
 
         # Statistics tracking for structured logging
         self.stats_per_partition = {}
@@ -173,8 +179,16 @@ class WrcDecisionsSpider(scrapy.Spider):
             try:
                 decision = self._extract_item(item_sel, meta)
                 if decision:
+                    identifier = decision.get("identifier", "")
+
+                    # Write-once idempotency: skip if already in landing zone
+                    if identifier in self.existing_identifiers:
+                        self.stats_per_partition[partition_key]["records_scraped"] += 1
+                        logger.debug("Skipped (exists in landing): %s", identifier)
+                        continue
+
+                    # New record — download the document
                     self.stats_per_partition[partition_key]["records_scraped"] += 1
-                    # Follow the document URL to download the actual content
                     doc_url = decision.get("doc_url", "")
                     if doc_url:
                         yield scrapy.Request(
@@ -235,6 +249,15 @@ class WrcDecisionsSpider(scrapy.Spider):
         # Published date: from <span class="date">31/03/2023</span>
         published_date = selector.css("span.date::text").get("").strip()
 
+        # Convert DD/MM/YYYY to ISO format (YYYY-MM-DD) for sortable MongoDB queries
+        published_date_iso = None
+        if published_date:
+            try:
+                day, month, year = published_date.split("/")
+                published_date_iso = f"{year}-{month}-{day}"
+            except (ValueError, IndexError):
+                published_date_iso = None
+
         # Description: from <p class="description">Richard Harford V G4s...</p>
         description = selector.css("p.description::text").getall()
         description = " ".join(d.strip() for d in description if d.strip())
@@ -250,6 +273,7 @@ class WrcDecisionsSpider(scrapy.Spider):
             identifier=identifier,
             description=description,
             published_date=published_date,
+            published_date_iso=published_date_iso,
             ref_no=ref_no,
             doc_url=doc_url,
             body=meta["body_name"],
@@ -301,26 +325,10 @@ class WrcDecisionsSpider(scrapy.Spider):
             # Default to HTML (most WRC decisions are HTML pages)
             file_type = "html"
 
-        # Calculate SHA-256 hash
-        # For HTML: hash only the main content text to avoid dynamic elements
-        # (cookie banners, session tokens, timestamps) that change every request.
-        # For PDF/DOC: hash the raw bytes since they don't have dynamic content.
-        if file_type == "html":
-            # Extract text from the main content area only
-            # This excludes navigation, footers, cookie banners, scripts
-            main_content = response.css("#main ::text").getall()
-            if not main_content:
-                # Fallback: try the content area or body text
-                main_content = response.css(".content-module-padding ::text, .decisions-body ::text, article ::text").getall()
-            if not main_content:
-                # Last fallback: all body text
-                main_content = response.css("body ::text").getall()
-            
-            # Join, strip whitespace, encode — this produces a stable hash
-            content_text = " ".join(t.strip() for t in main_content if t.strip())
-            file_hash = hashlib.sha256(content_text.encode("utf-8")).hexdigest()
-        else:
-            file_hash = hashlib.sha256(body_bytes).hexdigest()
+        # Calculate stable content hash using shared normalization.
+        # This strips dynamic elements (cookies, session tokens, nav bars)
+        # so the same logical content produces the same hash every time.
+        file_hash = compute_content_hash(body_bytes, file_type)
 
         # Build the storage path: body/partition/identifier.ext
         body_name = item.get("body", "unknown").replace(" ", "_")
@@ -335,7 +343,8 @@ class WrcDecisionsSpider(scrapy.Spider):
         # Temporary field — used by MinioPipeline, not stored in MongoDB
         item["_file_content"] = body_bytes
 
-
+        # Track identifier so duplicates within same run are skipped
+        self.existing_identifiers.add(item.get("identifier", ""))
 
         yield item
 
