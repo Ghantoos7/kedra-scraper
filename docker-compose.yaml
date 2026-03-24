@@ -15,7 +15,7 @@ services:
     image: mongo:7.0.14
     container_name: kedra-mongodb
     ports:
-      - "27017:27017"
+      - "27018:27017"
     volumes:
       - mongo_data:/data/db
     environment:
@@ -34,7 +34,7 @@ services:
   # Transformed Zone: transformed-docs bucket
   # ---------------------------------------------------------------------------
   minio:
-    image: minio/minio:RELEASE.2024-06-13T22-53-53Z
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
     container_name: kedra-minio
     ports:
       - "9000:9000"   # API endpoint
@@ -57,7 +57,7 @@ services:
   # Creates the landing-docs and transformed-docs buckets on startup
   # ---------------------------------------------------------------------------
   minio-init:
-    image: minio/mc:RELEASE.2024-06-12T14-34-03Z
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
     container_name: kedra-minio-init
     depends_on:
       minio:
