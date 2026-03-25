@@ -166,8 +166,8 @@ class MongoPipeline:
             self.client.close()
 
         logger.info(
-            "MongoDB summary: inserted=%d, updated=%d, skipped=%d",
-            self.inserted, self.updated, self.skipped,
+            "MongoDB summary: inserted=%d, skipped=%d",
+            self.inserted, self.skipped,
         )
 
     def process_item(self, item, spider):

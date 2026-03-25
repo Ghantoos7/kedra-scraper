@@ -10,9 +10,11 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Load .env file from project root
+# Load .env file from project root.
+# override=False ensures Docker environment variables take precedence
+# over .env file values when running inside containers.
 PROJECT_ROOT = Path(__file__).parent
-load_dotenv(PROJECT_ROOT / ".env")
+load_dotenv(PROJECT_ROOT / ".env", override=False)
 
 
 def _get_env(key: str, default: str = None, required: bool = False) -> str:
@@ -73,7 +75,7 @@ class ScrapingConfig:
     SEARCH_PATH = _get_env("WRC_SEARCH_PATH", "/en/search/")
     PARTITION_SIZE = _get_env("PARTITION_SIZE", "monthly")
     CONCURRENT_REQUESTS = _get_env_int("CONCURRENT_REQUESTS", 4)
-    DOWNLOAD_DELAY = _get_env_float("DOWNLOAD_DELAY", 1)
+    DOWNLOAD_DELAY = _get_env_float("DOWNLOAD_DELAY", 1.5)
     RETRY_TIMES = _get_env_int("RETRY_TIMES", 3)
     REQUEST_TIMEOUT = _get_env_int("REQUEST_TIMEOUT", 30)
     AUTOTHROTTLE_ENABLED = _get_env_bool("AUTOTHROTTLE_ENABLED", True)

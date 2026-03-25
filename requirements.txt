@@ -20,3 +20,7 @@ minio>=7.2,<8.0
 # HTML parsing (transformation step)
 beautifulsoup4>=4.12,<5.0
 lxml>=5.1,<6.0
+
+# Orchestration
+dagster==1.7.11
+dagster-webserver==1.7.11

@@ -103,6 +103,7 @@ class WrcDecisionsSpider(scrapy.Spider):
                     "partition_end": partition_end.isoformat(),
                     "total_results": 0,
                     "records_scraped": 0,
+                    "records_skipped": 0,
                     "records_failed": 0,
                     "failed_urls": [],
                 }
@@ -183,8 +184,7 @@ class WrcDecisionsSpider(scrapy.Spider):
 
                     # Write-once idempotency: skip if already in landing zone
                     if identifier in self.existing_identifiers:
-                        self.stats_per_partition[partition_key]["records_scraped"] += 1
-                        logger.debug("Skipped (exists in landing): %s", identifier)
+                        self.stats_per_partition[partition_key]["records_skipped"] += 1
                         continue
 
                     # New record — download the document
@@ -407,11 +407,13 @@ class WrcDecisionsSpider(scrapy.Spider):
         import json
 
         total_scraped = 0
+        total_skipped = 0
         total_failed = 0
         total_expected = 0
 
         for key, stats in self.stats_per_partition.items():
             total_scraped += stats["records_scraped"]
+            total_skipped += stats["records_skipped"]
             total_failed += stats["records_failed"]
             total_expected += stats["total_results"]
 
@@ -423,6 +425,7 @@ class WrcDecisionsSpider(scrapy.Spider):
             "reason": reason,
             "total_expected": total_expected,
             "total_scraped": total_scraped,
+            "total_skipped": total_skipped,
             "total_failed": total_failed,
             "partitions_processed": len(self.stats_per_partition),
         }

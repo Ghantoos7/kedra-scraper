@@ -84,7 +84,7 @@ services:
       dockerfile: Dockerfile
     container_name: kedra-dagster-webserver
     ports:
-      - "3000:3000"
+      - "3001:3000"
     volumes:
       - .:/app
       - dagster_home:/opt/dagster/dagster_home
@@ -93,6 +93,7 @@ services:
     environment:
       # Override hosts to use Docker service names instead of localhost
       MONGO_HOST: mongodb
+      MONGO_PORT: "27017"
       MINIO_ENDPOINT: minio:9000
       DAGSTER_HOME: /opt/dagster/dagster_home
     depends_on:
@@ -111,10 +112,12 @@ services:
     volumes:
       - .:/app
       - dagster_home:/opt/dagster/dagster_home
+    working_dir: /app
     env_file:
       - .env
     environment:
       MONGO_HOST: mongodb
+      MONGO_PORT: "27017"
       MINIO_ENDPOINT: minio:9000
       DAGSTER_HOME: /opt/dagster/dagster_home
     depends_on:
