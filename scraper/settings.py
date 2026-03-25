@@ -70,10 +70,10 @@ ITEM_PIPELINES = {
 }
 
 # --- Logging ---
-# Structured JSON logging as required by the spec.
-# Each log line is a JSON object for machine parsing.
+# Traditional format for readable output. Structured JSON data is embedded
+# in the partition summaries and crawl summary (requirement #10).
 LOG_LEVEL = LogConfig.LEVEL
-LOG_FORMAT = '{"timestamp": "%(asctime)s", "logger": "%(name)s", "level": "%(levelname)s", "message": "%(message)s"}'
+LOG_FORMAT = "%(asctime)s [%(name)s] %(levelname)s: %(message)s"
 
 # --- Caching (speeds up development — disable in production) ---
 # HTTPCACHE_ENABLED = True

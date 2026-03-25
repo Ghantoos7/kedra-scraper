@@ -97,11 +97,9 @@ SCRAPE_SHOW_KEYWORDS = [
     "MinIO pipeline ready",
     "Partition summary",
     "Crawl summary",
-    "Gave up retrying",
     "Request failed",
     "Document download failed",
     "Crawled",
-    "items/min",
 ]
 
 TRANSFORM_SHOW_KEYWORDS = [
@@ -137,7 +135,8 @@ def _parse_log_line(line: str) -> tuple:
     # Try JSON format first
     try:
         log_obj = json.loads(line)
-        return log_obj.get("level", "INFO"), log_obj.get("message", "")
+        if isinstance(log_obj, dict):
+            return log_obj.get("level", "INFO"), log_obj.get("message", "")
     except (json.JSONDecodeError, ValueError):
         pass
 
@@ -237,8 +236,6 @@ def _stream_subprocess(
             continue
 
         if _should_show_line(msg, keywords):
-            if "Partition summary:" in msg or "Crawl summary:" in msg:
-                msg = _format_json_summary(msg)
             _log_line(context, level, msg)
 
     # Also stream stdout (transformation script writes here)

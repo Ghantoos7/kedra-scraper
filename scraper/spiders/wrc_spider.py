@@ -20,6 +20,7 @@ HTML structure (from inspecting the live site):
 """
 
 import scrapy
+import json
 import logging
 from datetime import date, datetime
 from urllib.parse import urlencode
@@ -57,20 +58,41 @@ class WrcDecisionsSpider(scrapy.Spider):
             raise ValueError("Both start_date and end_date are required. "
                              "Usage: scrapy crawl wrc_decisions -a start_date=2024-01-01 -a end_date=2024-12-31")
 
-        self.start_dt = date.fromisoformat(start_date)
-        self.end_dt = date.fromisoformat(end_date)
+        try:
+            self.start_dt = date.fromisoformat(start_date)
+        except ValueError:
+            raise ValueError(f"Invalid start_date: '{start_date}'. Must be YYYY-MM-DD with a valid date (e.g., 2024-02-29 not 2024-02-30).")
+
+        try:
+            self.end_dt = date.fromisoformat(end_date)
+        except ValueError:
+            raise ValueError(f"Invalid end_date: '{end_date}'. Must be YYYY-MM-DD with a valid date (e.g., 2024-02-29 not 2024-02-30).")
+
+        if self.end_dt < self.start_dt:
+            raise ValueError(f"end_date ({end_date}) must be after start_date ({start_date}).")
         self.base_url = ScrapingConfig.search_url()
         self.bodies = BodyConfig.get_all()
 
-        # Preload existing identifiers for write-once idempotency.
+        # Preload existing identifiers for the requested date range.
         # Landing zone is append-only: never update, never delete.
         # If identifier exists → skip entirely (no download, no store).
+        # We only load identifiers for the partitions we're about to process,
+        # not the entire collection — scales better at 1M+ records.
         mongo_client = MongoClient(MongoConfig.connection_uri())
         collection = mongo_client[MongoConfig.DB][MongoConfig.LANDING_COLLECTION]
-        cursor = collection.find({}, {"identifier": 1, "_id": 0})
+        cursor = collection.find(
+            {
+                "partition_date": {
+                    "$gte": self.start_dt.isoformat(),
+                    "$lte": self.end_dt.isoformat(),
+                }
+            },
+            {"identifier": 1, "_id": 0},
+        )
         self.existing_identifiers = {doc["identifier"] for doc in cursor}
         mongo_client.close()
-        logger.info("Loaded %d existing identifiers for idempotency", len(self.existing_identifiers))
+        logger.info("Loaded %d existing identifiers for date range %s to %s",
+                     len(self.existing_identifiers), start_date, end_date)
 
         # Statistics tracking for structured logging
         self.stats_per_partition = {}
@@ -162,8 +184,9 @@ class WrcDecisionsSpider(scrapy.Spider):
         if page_number == 1 and total_results is not None:
             self.stats_per_partition[partition_key]["total_results"] = total_results
             logger.info(
-                "Found %d results: body=%s, partition=%s, page=%d",
-                total_results, body_name, partition_start.isoformat(), page_number,
+                "Found %d results: %s",
+                total_results,
+                json.dumps({"body": body_name, "partition": partition_start.isoformat(), "page": page_number, "total_results": total_results}),
             )
 
         # Parse each result item on the page
@@ -171,8 +194,8 @@ class WrcDecisionsSpider(scrapy.Spider):
 
         if not items:
             logger.info(
-                "No results on page: body=%s, partition=%s, page=%d",
-                body_name, partition_start.isoformat(), page_number,
+                "No results on page: %s",
+                json.dumps({"body": body_name, "partition": partition_start.isoformat(), "page": page_number}),
             )
             return
 
@@ -351,24 +374,30 @@ class WrcDecisionsSpider(scrapy.Spider):
     def handle_doc_error(self, failure):
         """
         Handle document download failures.
+        Logs the failure as structured JSON.
         Still yields the item so metadata is saved, but without file info.
         """
+
         request = failure.request
         meta = request.meta
         item = meta.get("item")
         partition_key = meta.get("partition_key", "unknown")
 
-        logger.error(
-            "Document download failed: identifier=%s, url=%s, error=%s",
-            item.get("identifier", "unknown") if item else "unknown",
-            request.url,
-            str(failure.value),
-        )
+        error_record = {
+            "event": "document_download_failed",
+            "identifier": item.get("identifier", "unknown") if item else "unknown",
+            "url": request.url,
+            "error": str(failure.value),
+            "body": meta.get("body_name", "unknown"),
+            "partition": meta.get("partition_start", "unknown").isoformat() if hasattr(meta.get("partition_start", ""), "isoformat") else str(meta.get("partition_start", "unknown")),
+        }
+        logger.error("Document download failed: %s", json.dumps(error_record))
 
         if partition_key in self.stats_per_partition:
+            self.stats_per_partition[partition_key]["records_failed"] += 1
             self.stats_per_partition[partition_key]["failed_urls"].append({
                 "url": request.url,
-                "error": f"Document download failed: {str(failure.value)}",
+                "error": str(failure.value),
             })
 
         # Still yield the item with metadata, just without file info
@@ -380,12 +409,22 @@ class WrcDecisionsSpider(scrapy.Spider):
 
     def handle_error(self, failure):
         """
-        Handle request failures (timeouts, connection errors, etc.).
-        Logs the failure with the URL and error for the structured log summary.
+        Handle search page request failures (timeouts, connection errors).
+        Logs the failure as structured JSON.
         """
+
         request = failure.request
         meta = request.meta
         partition_key = meta.get("partition_key", "unknown")
+
+        error_record = {
+            "event": "request_failed",
+            "url": request.url,
+            "error": str(failure.value),
+            "body": meta.get("body_name", "unknown"),
+            "partition": meta.get("partition_start", "unknown").isoformat() if hasattr(meta.get("partition_start", ""), "isoformat") else str(meta.get("partition_start", "unknown")),
+        }
+        logger.error("Request failed: %s", json.dumps(error_record))
 
         if partition_key in self.stats_per_partition:
             self.stats_per_partition[partition_key]["records_failed"] += 1
@@ -394,17 +433,12 @@ class WrcDecisionsSpider(scrapy.Spider):
                 "error": str(failure.value),
             })
 
-        logger.error(
-            "Request failed: url=%s, error=%s",
-            request.url, str(failure.value),
-        )
-
     def closed(self, reason):
         """
         Called when the spider finishes. Produces the structured log summary
         required by the project brief.
         """
-        import json
+
 
         total_scraped = 0
         total_skipped = 0
