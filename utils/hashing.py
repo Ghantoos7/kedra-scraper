@@ -95,8 +95,11 @@ def normalize_html_content(raw_bytes: bytes) -> str:
         ".ptools-pager",
         "#advancedSearchControls",
         "#searchPnl",
-        ".aspNetHidden",           # ASP.NET hidden fields (CSRF, ViewState)
-        "input[type='hidden']",    # Hidden form inputs
+        ".searchbanner",
+        "#skippy",
+        ".sr-only",
+        ".aspNetHidden",
+        "input[type='hidden']",
     ]
     for selector in volatile_selectors:
         for element in soup.select(selector):
